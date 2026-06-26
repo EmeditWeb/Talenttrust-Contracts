@@ -1,49 +1,209 @@
 # Storage Layout Reference — TalentTrust Escrow Contract
 
-This document maps the currently implemented `DataKey` storage used by
-`contracts/escrow/src/lib.rs`. A fuller key-by-key reference, including
-declared-but-unused keys, is tracked in
-[#342](https://github.com/Talenttrust/Talenttrust-Contracts/issues/342).
+This document is the **authoritative map** of every `DataKey` variant defined in
+`contracts/escrow/src/types.rs` to its storage tier, value type, writer/reader
+entrypoints, and TTL (time-to-live) behavior.
 
-## Live Storage Keys
+**Cross-reference:**
+- TTL constants: [`contracts/escrow/src/ttl.rs`](../../contracts/escrow/src/ttl.rs)
+- Temporary-storage TTL policy: [`storage-ttl.md`](./storage-ttl.md)
+- DataKey source enum: [`contracts/escrow/src/types.rs`](../../contracts/escrow/src/types.rs)
 
-| Key | Value | Written by |
-| --- | --- | --- |
-| `Initialized` | `bool` | `initialize` |
-| `Admin` | `Address` | `initialize` |
-| `Paused` | `bool` | `pause`, `unpause`, emergency controls |
-| `Emergency` | `bool` | emergency controls |
-| `Contract(id)` | `EscrowContractData` | create/deposit/release/reputation/cancel |
-| `NextContractId` | `u32` | `create_contract` |
-| `MilestoneReleased(id, index)` | `bool` | `release_milestone` |
-| `ReputationIssued(id)` | `bool` | `issue_reputation` |
-| `PendingReputationCredits(address)` | `u32` | final release, `issue_reputation` |
-| `Reputation(address)` | `ReputationRecord` | `issue_reputation` |
-| `Finalization(id)` | `FinalizationRecord` | `finalize_contract` |
-| `ReadinessChecklist` | `ReadinessChecklist` | initialize and emergency controls |
+---
 
-## Declared But Not Live
+## TTL Constants (from `ttl.rs`)
 
-These keys are declared in `types.rs` but no public entrypoint currently uses
-them as a complete feature:
+| Constant | Ledgers | Duration |
+|---|---|---|
+| `LEDGERS_PER_DAY` | 17 280 | 1 day |
+| `PERSISTENT_TTL_LEDGERS` | 518 400 | 30 days |
+| `PERSISTENT_BUMP_THRESHOLD` | 120 960 | 7 days |
+| `PENDING_APPROVAL_TTL_LEDGERS` | 120 960 | 7 days |
+| `PENDING_APPROVAL_BUMP_THRESHOLD` | 17 280 | 1 day |
+| `PENDING_MIGRATION_TTL_LEDGERS` | 362 880 | 21 days |
+| `PENDING_MIGRATION_BUMP_THRESHOLD` | 51 840 | 3 days |
 
-- `MilestoneApprovals`
-- `PendingClientMigration`
-- `ProtocolFeeBps`
-- `AccumulatedProtocolFees`
+All persistent keys use `PERSISTENT_TTL_LEDGERS` (30 days) with
+`PERSISTENT_BUMP_THRESHOLD` (7 days). Temporary keys use their own constants.
 
-Protocol fee implementation is tracked in
-[#313](https://github.com/Talenttrust/Talenttrust-Contracts/issues/313) and
-[#314](https://github.com/Talenttrust/Talenttrust-Contracts/issues/314).
+---
 
-### 3. Reputation Auditing States
-* **`PendingReputation(Address)` / `ReputationIssued(u32)`**
-    * **Description:** Bookkeeping indices capturing un-issued tokens and completion certificates for network participants.
-    * **Storage Lifespan:** `Persistent`. Preserved explicitly to guarantee deterministic chronological processing when users harvest pending system values.
+## Storage Tier Legend
 
-- Contract ids are monotonically assigned from `NextContractId`.
-- Milestone amounts and participant addresses are immutable after creation.
-- `total_deposited`, `released_amount`, and `refunded_amount` are checked after
-  balance-changing operations.
-- A milestone release flag can move from absent/false to true only once.
-- Reputation issuance is guarded by `ReputationIssued(contract_id)`.
+- **Persistent** (`env.storage().persistent()`) — survives upgrades; TTL managed
+  manually via `extend_ttl`. Soroban evicts persistent entries after their TTL
+  expires.
+- **Temporary** (`env.storage().temporary()`) — auto-evicted by Soroban after
+  TTL elapses; `read_if_live` returns `None` for absent *or* expired entries.
+- **Instance** (`env.storage().instance()`) — contract-level storage (not used
+  by any current `DataKey` variant).
+
+---
+
+## Storage Map
+
+### Admin / Pause / Emergency
+
+| DataKey | Tier | Value Type | Written By | Read By | TTL Policy |
+|---|---|---|---|---|---|
+| `Initialized` | Persistent | `bool` | `initialize` | `initialize`, `require_initialized`, `set_protocol_fee_bps`, `propose_governance_admin`, `accept_governance_admin` | No bump on access. Uses default persistent TTL (30 d). |
+| `Admin` | Persistent | `Address` | `initialize`, `accept_governance_admin` | `get_admin`, `pause`, `unpause`, `activate_emergency_pause`, `resolve_emergency`, `set_protocol_fee_bps`, `propose_governance_admin`, `accept_governance_admin`, `get_governance_admin` | No bump on access. Uses default persistent TTL (30 d). |
+| `Paused` | Persistent | `bool` | `pause`, `unpause`, `activate_emergency_pause`, `resolve_emergency` | `is_paused`, `require_not_paused`, `unpause` (guard) | No bump on access. Uses default persistent TTL (30 d). |
+| `Emergency` | Persistent | `bool` | `activate_emergency_pause`, `resolve_emergency` | `is_emergency`, `unpause` (guard) | No bump on access. Uses default persistent TTL (30 d). |
+
+### Contract Storage
+
+| DataKey | Tier | Value Type | Written By | Read By | TTL Policy |
+|---|---|---|---|---|---|
+| `Contract(u32)` | Persistent | `Contract` (types.rs:151) | `create_contract`, `deposit_funds`, `release_milestone`, `refund_unreleased_milestones`, `cancel_contract`, `accept_client_migration` | `deposit_funds`, `release_milestone`, `refund_unreleased_milestones`, `get_contract`, `get_refundable_balance`, `cancel_contract`, `issue_reputation`, `approve_milestone`, `load_contract_for_finalization`, `load_contract` (migration) | **Bumped on every read/write** via `extend_contract_ttl`: bump threshold = 7 d, extend to = 30 d. |
+| `(Contract(u32), "milestones")` *(composite key)* | Persistent | `Vec<Milestone>` | `create_contract`, `release_milestone`, `refund_unreleased_milestones` | `deposit_funds`, `release_milestone`, `refund_unreleased_milestones`, `get_milestones`, `approve_milestone` | **Bumped on every read/write** via `extend_milestone_ttl`: bump threshold = 7 d, extend to = 30 d. |
+| `NextContractId` | Persistent | `u32` | `create_contract`, `bump_next_contract_id` | `next_contract_id`, `create_contract` | **Bumped on every write** via `extend_next_contract_id_ttl`: bump threshold = 7 d, extend to = 30 d. |
+| `MilestoneReleased(u32, u32)` | Persistent | `bool` | *(vestigial — never written in production code)* | `summarize_contract` (finalize.rs:63) | No bump. Read as `unwrap_or(false)`. |
+| `MilestoneApprovals(u32, u32)` | **Temporary** | `MilestoneApprovals` (types.rs:180) | `approve_milestone` (approvals.rs:140) | `approve_milestone` (load-or-create), `check_approvals`, `get_milestone_approvals` | TTL set on write: **7 d** (PENDING_APPROVAL_TTL_LEDGERS). Bump threshold = **1 d** (PENDING_APPROVAL_BUMP_THRESHOLD). Cleared by `clear_approvals` after release. **No bump on read** — fail-closed if expired. |
+
+### MilestoneReleased — Key Status
+
+`MilestoneReleased(u32, u32)` is **vestigial**. The canonical release flag is the
+`released: bool` field on each `Milestone` struct stored in the milestones
+vector. The DataKey variant is only read by `summarize_contract` in finalize.rs
+(via `unwrap_or(false)`), and is never written by production entrypoints. It
+remains defined for backward-compatible indexing.
+
+### Reputation
+
+| DataKey | Tier | Value Type | Written By | Read By | TTL Policy |
+|---|---|---|---|---|---|
+| `ReputationIssued(u32)` | Persistent | `bool` | `issue_reputation` | `issue_reputation` (guard) | No bump. |
+| `PendingReputationCredits(Address)` | Persistent | `i128` | `issue_reputation` (decrement), internal completion logic (increment) | `issue_reputation`, `get_pending_reputation_credits` | No bump. |
+| `Reputation(Address)` | Persistent | `Reputation` (types.rs:194) | `issue_reputation` | `issue_reputation`, `get_reputation` | No bump. |
+
+### Client Migration
+
+| DataKey | Tier | Value Type | Written By | Read By | TTL Policy |
+|---|---|---|---|---|---|
+| `PendingClientMigration(u32)` | **Temporary** | `PendingClientMigration` (migration.rs:9) | `propose_client_migration` | `pending_migration_exists`, `accept_client_migration`, `get_pending_client_migration` | TTL set on write via `store_with_ttl`: **21 d** (PENDING_MIGRATION_TTL_LEDGERS). Cleared by `remove_transient` on accept. **No bump on read.** |
+
+### Protocol / Governance
+
+| DataKey | Tier | Value Type | Written By | Read By | TTL Policy |
+|---|---|---|---|---|---|
+| `GovernanceAdmin` | *(unused)* | — | — | — | N/A. The governance module uses `DataKey::Admin` instead. |
+| `PendingGovernanceAdmin` | *(unused)* | — | — | — | N/A. The governance module uses `DataKey::PendingAdmin` instead. |
+| `ProtocolParameters` | *(unused)* | — | — | — | N/A. Declared but never stored. |
+| `ProtocolFeeBps` | Persistent | `u32` | `set_protocol_fee_bps` | `set_protocol_fee_bps`, `get_protocol_fee_bps` | No bump. |
+| `PendingAdmin` | Persistent | `Address` | `propose_governance_admin` | `accept_governance_admin`, `get_pending_governance_admin` | No bump. Cleared by `remove` on accept. |
+| `AccumulatedProtocolFees` | Persistent | `i128` | `release_milestone` (increment) | `release_milestone` (read before increment) | No bump. |
+| `GovernedParameters` | *(unused)* | — | — | — | N/A. Declared but never stored. |
+| `ReadinessChecklist` | Persistent | `ReadinessChecklist` (types.rs:92) | `initialize`, `activate_emergency_pause` | `initialize`, `get_mainnet_readiness_info`, `activate_emergency_pause` | No bump. |
+
+### Finalization
+
+| DataKey | Tier | Value Type | Written By | Read By | TTL Policy |
+|---|---|---|---|---|---|
+| `Finalization(u32)` | Persistent | `FinalizationRecord` (finalize.rs:16) | `finalize_contract` | `get_finalization_record` | No bump. Written once (immutable close metadata). |
+
+---
+
+## Bump-on-Access Summary
+
+Only **three** key families receive explicit TTL extension on every access:
+
+| Key(s) | Mechanism | Bump Threshold | Extend To |
+|---|---|---|---|
+| `Contract(u32)` | `ttl::extend_contract_ttl` | 7 days | 30 days |
+| `(Contract(u32), "milestones")` | `ttl::extend_milestone_ttl` | 7 days | 30 days |
+| `NextContractId` | `ttl::extend_next_contract_id_ttl` | 7 days | 30 days |
+| `MilestoneApprovals(u32, u32)` | `extend_ttl` in `approve_milestone` | 1 day | 7 days |
+
+All other persistent keys (`Initialized`, `Admin`, `Paused`, `Emergency`,
+`ReputationIssued`, `PendingReputationCredits`, `Reputation`, `ProtocolFeeBps`,
+`PendingAdmin`, `AccumulatedProtocolFees`, `ReadinessChecklist`,
+`Finalization`) are **never bumped on read**. They rely on the initial write TTL
+and are vulnerable to eviction if the contract goes untouched for 30 days.
+
+---
+
+## Unused / Declared-Only Variants
+
+These four variants are defined in the enum but are **never stored or retrieved**
+in production code. They exist for forward-looking schema design:
+
+| DataKey | Notes |
+|---|---|
+| `GovernanceAdmin` | Superseded by `DataKey::Admin`. |
+| `PendingGovernanceAdmin` | Superseded by `DataKey::PendingAdmin`. |
+| `ProtocolParameters` | Never written. Governance uses `ProtocolFeeBps` + `GovernedParameters` struct. |
+| `GovernedParameters` | The `GovernedParameters` struct (types.rs:113) is used as a value type but **never stored** under this DataKey variant. |
+
+---
+
+## Security Notes
+
+1. **Missing TTL bumps on read-only keys** — `Admin`, `Initialized`, `Paused`,
+   `Emergency`, `ReputationIssued`, `PendingReputationCredits`, `Reputation`,
+   `ProtocolFeeBps`, `PendingAdmin`, `AccumulatedProtocolFees`,
+   `ReadinessChecklist`, and `Finalization` are never TTL-extended after the
+   initial write. If the entire contract is inactive for >30 days, these keys
+   become eligible for Soroban auto-eviction, which could brick admin access
+   and governance. Consider a background bump heartbeat or bundling with active
+   key bumps.
+
+2. **`MilestoneReleased(u32, u32)` is vestigial** — The canonical release
+   tracking lives in the `Milestone.released` field. The DataKey variant is
+   never written, only read in `summarize_contract`. Indexers should rely on
+   the milestones vector, not this key.
+
+3. **`MilestoneApprovals` TTL is write-only** — Approval TTL is set at write
+   time in `approve_milestone` but is **not bumped on read** in
+   `check_approvals`. Once the 7-day window elapses, approvals auto-evict,
+   causing `check_approvals` to return `InsufficientApprovals`. This is
+   intentional (fail-closed), but callers must be aware that prolonged approval
+   periods require the approver to re-approve.
+
+4. **`PendingClientMigration` TTL is write-only** — Set once at proposal (21 d)
+   and never bumped on read. The migration must be accepted before eviction.
+
+5. **Removal hygiene** — `PendingAdmin` and `PendingClientMigration` are
+   explicitly removed on successful acceptance. `MilestoneApprovals` entries
+   are removed after milestone release via `clear_approvals`. All other keys
+   persist indefinitely (until TTL eviction).
+
+---
+
+## Verification: Enum Completeness
+
+The table above covers **every** variant in the `DataKey` enum
+(contracts/escrow/src/types.rs:5-34). The following test verifies that no
+variant is omitted:
+
+```rust
+#[test]
+fn all_datakey_variants_are_documented() {
+    // This test compiles to a single assertion: listing a variant here
+    // forces a compilation error if the enum gains new variants.
+    // Each variant listed below is documented in state-persistence.md.
+    let _ = |dk: DataKey| match dk {
+        DataKey::Initialized
+        | DataKey::Admin
+        | DataKey::Paused
+        | DataKey::Emergency
+        | DataKey::Contract(_)
+        | DataKey::NextContractId
+        | DataKey::MilestoneReleased(_, _)
+        | DataKey::MilestoneApprovals(_, _)
+        | DataKey::ReputationIssued(_)
+        | DataKey::PendingReputationCredits(_)
+        | DataKey::Reputation(_)
+        | DataKey::PendingClientMigration(_)
+        | DataKey::GovernanceAdmin
+        | DataKey::PendingGovernanceAdmin
+        | DataKey::ProtocolParameters
+        | DataKey::ProtocolFeeBps
+        | DataKey::PendingAdmin
+        | DataKey::AccumulatedProtocolFees
+        | DataKey::GovernedParameters
+        | DataKey::ReadinessChecklist
+        | DataKey::Finalization(_) => {}
+    };
+}
+```
