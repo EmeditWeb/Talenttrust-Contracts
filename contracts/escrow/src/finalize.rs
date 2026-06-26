@@ -1,9 +1,8 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
 
 use crate::{
-    safe_add_amounts, safe_subtract_amounts, ContractStatus, ContractSummary, DataKey, Escrow,
-    EscrowArgs, EscrowClient, EscrowContractData, EscrowError, MilestoneSummary,
-    CONTRACT_SUMMARY_SCHEMA_VERSION,
+    safe_subtract_amounts, Contract, ContractStatus, ContractSummary, DataKey, Escrow, EscrowError,
+    Milestone, MilestoneSummary, CONTRACT_SUMMARY_SCHEMA_VERSION,
 };
 
 /// Immutable metadata written when an escrow contract is closed.
@@ -18,7 +17,7 @@ pub struct FinalizationRecord {
     pub finalizer: Address,
     /// Ledger timestamp at finalization time.
     pub timestamp: u64,
-    /// Snapshot of participant, milestone, status, and accounting state.
+    /// Snapshot of participant, milestone, and accounting state.
     pub summary: ContractSummary,
 }
 
@@ -27,14 +26,45 @@ impl Escrow {
         DataKey::Finalization(contract_id)
     }
 
-    fn load_contract_for_finalization(env: &Env, contract_id: u32) -> EscrowContractData {
+    fn load_contract_for_finalization(env: &Env, contract_id: u32) -> Contract {
         env.storage()
             .persistent()
-            .get::<_, EscrowContractData>(&DataKey::Contract(contract_id))
+            .get::<_, Contract>(&DataKey::Contract(contract_id))
             .unwrap_or_else(|| env.panic_with_error(EscrowError::ContractNotFound))
     }
 
-    fn require_finalizer_role(env: &Env, contract: &EscrowContractData, finalizer: &Address) {
+    pub(crate) fn is_finalized(env: &Env, contract_id: u32) -> bool {
+        env.storage()
+            .persistent()
+            .has(&Self::finalization_key(contract_id))
+    }
+
+    pub(crate) fn require_not_finalized(env: &Env, contract_id: u32) {
+        if Self::is_finalized(env, contract_id) {
+            env.panic_with_error(EscrowError::AlreadyFinalized);
+        }
+    }
+
+    pub(crate) fn require_not_paused(env: &Env) {
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            env.panic_with_error(EscrowError::ContractPaused);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Emergency)
+            .unwrap_or(false)
+        {
+            env.panic_with_error(EscrowError::EmergencyActive);
+        }
+    }
+
+    fn require_finalizer_role(env: &Env, contract: &Contract, finalizer: &Address) {
         let is_client = *finalizer == contract.client;
         let is_freelancer = *finalizer == contract.freelancer;
         let is_arbiter = contract.arbiter.clone().is_some_and(|a| a == *finalizer);
@@ -43,41 +73,35 @@ impl Escrow {
         }
     }
 
-    fn summarize_contract(
-        env: &Env,
-        contract_id: u32,
-        contract: &EscrowContractData,
-    ) -> ContractSummary {
+    fn summarize_contract(env: &Env, contract_id: u32, contract: &Contract) -> ContractSummary {
+        let milestones = crate::ttl::load_milestones(env, contract_id);
+
         let mut total_amount: i128 = 0;
         let mut released_milestone_count: u32 = 0;
-        let mut milestones = Vec::new(env);
+        let mut milestone_summaries = Vec::new(env);
 
-        for index in 0..contract.milestones.len() {
-            let amount = contract.milestones.get(index).unwrap();
-            total_amount = safe_add_amounts(total_amount, amount)
+        for (index, ms) in milestones.iter().enumerate() {
+            let idx = index as u32;
+            total_amount = total_amount
+                .checked_add(ms.amount)
                 .unwrap_or_else(|| env.panic_with_error(EscrowError::PotentialOverflow));
 
-            let released = env
-                .storage()
-                .persistent()
-                .get::<_, bool>(&DataKey::MilestoneReleased(contract_id, index))
-                .unwrap_or(false);
-            if released {
+            if ms.released {
                 released_milestone_count = released_milestone_count
                     .checked_add(1)
                     .unwrap_or_else(|| env.panic_with_error(EscrowError::PotentialOverflow));
             }
 
-            milestones.push_back(MilestoneSummary {
-                index,
-                amount,
-                released,
-                refunded: false,
+            milestone_summaries.push_back(MilestoneSummary {
+                index: idx,
+                amount: ms.amount,
+                released: ms.released,
+                refunded: ms.refunded,
             });
         }
 
         let after_releases =
-            safe_subtract_amounts(contract.total_deposited, contract.released_amount)
+            safe_subtract_amounts(contract.funded_amount, contract.released_amount)
                 .unwrap_or_else(|| env.panic_with_error(EscrowError::AccountingInvariantViolated));
         let refundable_balance = safe_subtract_amounts(after_releases, contract.refunded_amount)
             .unwrap_or_else(|| env.panic_with_error(EscrowError::AccountingInvariantViolated));
@@ -90,66 +114,63 @@ impl Escrow {
             status: contract.status,
             reputation_issued: contract.reputation_issued,
             total_amount,
-            funded_amount: contract.total_deposited,
+            funded_amount: contract.funded_amount,
             released_amount: contract.released_amount,
             refundable_balance,
             released_milestone_count,
-            milestones,
+            milestones: milestone_summaries,
         }
     }
 }
 
-#[soroban_sdk::contractimpl]
-impl Escrow {
-    /// Finalize an escrow contract by writing immutable close metadata.
-    ///
-    /// `finalizer` must authorize the call and must be the stored client,
-    /// freelancer, or assigned arbiter. Finalization is allowed only while the
-    /// contract is `Completed` or `Disputed`. Once finalized, future
-    /// contract-specific mutations fail with `AlreadyFinalized`.
-    ///
-    /// # Errors
-    /// - `ContractPaused` when pause or emergency controls are active.
-    /// - `ContractNotFound` when `contract_id` is unknown.
-    /// - `AlreadyFinalized` when a close record already exists.
-    /// - `UnauthorizedRole` when `finalizer` is not a contract participant.
-    /// - `InvalidStatusTransition` unless status is `Completed` or `Disputed`.
-    pub fn finalize_contract(env: Env, contract_id: u32, finalizer: Address) -> bool {
-        Self::require_not_paused(&env);
-        finalizer.require_auth();
+/// Finalize an escrow contract by writing immutable close metadata.
+///
+/// `finalizer` must authorize the call and must be the stored client,
+/// freelancer, or assigned arbiter. Finalization is allowed only while the
+/// contract is `Completed` or `Disputed`. Once finalized, future
+/// contract-specific mutations fail with `AlreadyFinalized`.
+///
+/// # Errors
+/// - `ContractPaused` when pause or emergency controls are active.
+/// - `ContractNotFound` when `contract_id` is unknown.
+/// - `AlreadyFinalized` when a close record already exists.
+/// - `UnauthorizedRole` when `finalizer` is not a contract participant.
+/// - `InvalidStatusTransition` unless status is `Completed` or `Disputed`.
+pub fn finalize_contract_impl(env: &Env, contract_id: u32, finalizer: Address) -> bool {
+    Escrow::require_not_paused(&env);
+    finalizer.require_auth();
 
-        let contract = Self::load_contract_for_finalization(&env, contract_id);
-        Self::require_not_finalized(&env, contract_id);
-        Self::require_finalizer_role(&env, &contract, &finalizer);
+    let contract = Escrow::load_contract_for_finalization(&env, contract_id);
+    Escrow::require_not_finalized(&env, contract_id);
+    Escrow::require_finalizer_role(&env, &contract, &finalizer);
 
-        if contract.status != ContractStatus::Completed
-            && contract.status != ContractStatus::Disputed
-        {
-            env.panic_with_error(EscrowError::InvalidStatusTransition);
-        }
-
-        let record = FinalizationRecord {
-            finalizer: finalizer.clone(),
-            timestamp: env.ledger().timestamp(),
-            summary: Self::summarize_contract(&env, contract_id, &contract),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&Self::finalization_key(contract_id), &record);
-
-        env.events().publish(
-            (symbol_short!("finalized"), contract_id),
-            (finalizer, record.timestamp),
-        );
-
-        true
+    if contract.status != ContractStatus::Completed
+        && contract.status != ContractStatus::Disputed
+    {
+        env.panic_with_error(EscrowError::InvalidStatusTransition);
     }
 
-    /// Return immutable close metadata for `contract_id`, if it has been finalized.
-    pub fn get_finalization_record(env: Env, contract_id: u32) -> Option<FinalizationRecord> {
-        env.storage()
-            .persistent()
-            .get(&Self::finalization_key(contract_id))
-    }
+    let record = FinalizationRecord {
+        finalizer: finalizer.clone(),
+        timestamp: env.ledger().timestamp(),
+        summary: Escrow::summarize_contract(&env, contract_id, &contract),
+    };
+
+    env.storage()
+        .persistent()
+        .set(&Escrow::finalization_key(contract_id), &record);
+
+    env.events().publish(
+        (symbol_short!("finalized"), contract_id),
+        (finalizer, record.timestamp),
+    );
+
+    true
+}
+
+/// Return immutable close metadata for `contract_id`, if it has been finalized.
+pub fn get_finalization_record_impl(env: &Env, contract_id: u32) -> Option<FinalizationRecord> {
+    env.storage()
+        .persistent()
+        .get(&Escrow::finalization_key(contract_id))
 }

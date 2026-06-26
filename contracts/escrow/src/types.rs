@@ -1,5 +1,53 @@
 use soroban_sdk::{contracterror, contracttype, Address, String, Vec};
 
+// ─── Indexer summary types ────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+pub const CONTRACT_SUMMARY_SCHEMA_VERSION: u32 = 1;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneSummary {
+    pub index: u32,
+    pub amount: i128,
+    pub released: bool,
+    pub refunded: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractSummary {
+    pub schema_version: u32,
+    pub client: Address,
+    pub freelancer: Address,
+    pub arbiter: Option<Address>,
+    pub status: ContractStatus,
+    pub reputation_issued: bool,
+    pub total_amount: i128,
+    pub funded_amount: i128,
+    pub released_amount: i128,
+    pub refundable_balance: i128,
+    pub released_milestone_count: u32,
+    pub milestones: Vec<MilestoneSummary>,
+}
+
+/// Main escrow contract state
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Contract {
+    pub client: Address,
+    pub freelancer: Address,
+    pub arbiter: Option<Address>,
+    pub status: ContractStatus,
+    pub total_deposited: i128,
+    pub funded_amount: i128,
+    pub released_amount: i128,
+    pub refunded_amount: i128,
+    pub release_authorization: ReleaseAuthorization,
+}
+
+// ─── Storage keys ──────────────────────────────────────────────────────────────
+
 /// Mapping from every `DataKey` variant to its storage tier, value type, and TTL
 /// behavior. See `docs/escrow/state-persistence.md` for the full reference table.
 ///
@@ -38,8 +86,8 @@ pub enum DataKey {
     /// Persistent · `u32` · Written by `create_contract`, `bump_next_contract_id` · **Bumped on every write** (30 d).
     /// Monotonically incrementing counter for contract ID allocation.
     NextContractId,
-    /// Persistent · `bool` · **Vestigial** — never written in production code. Read only by `summarize_contract`.
-    /// Canonical release state is `Milestone.released`. Kept for backward-compatible indexing.
+    /// Persistent · `bool` · **Not written** after Milestone.released field became canonical.
+    /// Legacy variant kept for backward-compatible indexing.
     MilestoneReleased(u32, u32),
     /// **Temporary** · `MilestoneApprovals` · Written by `approve_milestone` · TTL = 7 d, bump threshold = 1 d.
     /// Multi-sig approval tracking. Auto-evicted by Soroban; fail-closed on expiry.
@@ -75,7 +123,7 @@ pub enum DataKey {
     /// Persistent · `i128` · Written by `release_milestone` (increment) · **No TTL bump on access**.
     /// Running total of protocol fees collected.
     AccumulatedProtocolFees,
-    /// *(Unused)* — `GovernedParameters` struct (lines 113-116) is used as a value type but never stored under this key.
+    /// *(Unused)* — `GovernedParameters` struct is used as a value type but never stored under this key.
     GovernedParameters,
     /// Persistent · `ReadinessChecklist` · Written by `initialize`, `activate_emergency_pause` · **No TTL bump on access**.
     /// Bitfield tracking initialization, params, and emergency state for mainnet readiness.
@@ -86,6 +134,7 @@ pub enum DataKey {
     Finalization(u32),
 }
 
+/// Canonical contract error type for all entrypoint-facing errors.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -113,8 +162,11 @@ pub enum Error {
     InvalidMilestoneAmount = 26,
     ContractIdCollision = 27,
     ContractIdOverflow = 28,
+    EmptyComment = 29,
+    CommentTooLong = 30,
 }
 
+/// Contract lifecycle states
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContractStatus {
@@ -137,6 +189,46 @@ pub struct Milestone {
     pub refunded: bool,
     pub work_evidence: Option<String>,
     pub refunded_amount: i128,
+}
+
+/// Defines who can approve milestone releases.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseAuthorization {
+    /// Only client can approve.
+    ClientOnly = 0,
+    /// Either client or arbiter can approve.
+    ClientAndArbiter = 1,
+    /// Only arbiter can approve.
+    ArbiterOnly = 2,
+    /// Both client and freelancer must approve; only either of them may release
+    /// after both approvals are present.
+    MultiSig = 3,
+}
+
+/// Tracks approval status for a milestone.
+/// Stored in temporary storage with TTL for expiry grace period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneApprovals {
+    pub client_approved: bool,
+    pub freelancer_approved: bool,
+    pub arbiter_approved: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepositMode {
+    ExactTotal = 0,
+    Incremental = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct Reputation {
+    pub completed_contracts: i128,
+    pub total_rating: i128,
+    pub last_rating: i128,
 }
 
 /// Readiness checklist stored under [`DataKey::ReadinessChecklist`].
@@ -166,87 +258,4 @@ impl Default for ReadinessChecklist {
 pub struct GovernedParameters {
     pub protocol_fee_bps: u32,
     pub max_escrow_total_stroops: i128,
-}
-
-// ΓöÇΓöÇΓöÇ Indexer summary types ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-
-#[allow(dead_code)]
-pub const CONTRACT_SUMMARY_SCHEMA_VERSION: u32 = 1;
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MilestoneSummary {
-    pub index: u32,
-    pub amount: i128,
-    pub released: bool,
-    pub refunded: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractSummary {
-    pub schema_version: u32,
-    pub client: Address,
-    pub freelancer: Address,
-    pub arbiter: Option<Address>,
-    pub status: ContractStatus,
-    pub reputation_issued: bool,
-    pub total_amount: i128,
-    pub funded_amount: i128,
-    pub released_amount: i128,
-    pub refundable_balance: i128,
-    pub released_milestone_count: u32,
-    pub milestones: Vec<MilestoneSummary>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Contract {
-    pub client: Address,
-    pub freelancer: Address,
-    pub arbiter: Option<Address>,
-    pub status: ContractStatus,
-    pub funded_amount: i128,
-    pub released_amount: i128,
-    pub refunded_amount: i128,
-    pub release_authorization: ReleaseAuthorization,
-}
-
-/// Defines who can approve milestone releases.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReleaseAuthorization {
-    /// Only client can approve.
-    ClientOnly = 0,
-    /// Either client or arbiter can approve.
-    ClientAndArbiter = 1,
-    /// Only arbiter can approve.
-    ArbiterOnly = 2,
-    /// Both client and freelancer must approve.
-    MultiSig = 3,
-}
-
-/// Tracks approval status for a milestone.
-/// Stored in temporary storage with TTL for expiry grace period.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MilestoneApprovals {
-    pub client_approved: bool,
-    pub freelancer_approved: bool,
-    pub arbiter_approved: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DepositMode {
-    ExactTotal = 0,
-    Incremental = 1,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
-pub struct Reputation {
-    pub completed_contracts: i128,
-    pub total_rating: i128,
-    pub last_rating: i128,
 }
